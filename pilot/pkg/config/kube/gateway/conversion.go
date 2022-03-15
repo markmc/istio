@@ -177,7 +177,7 @@ func convertVirtualService(r *KubernetesResources, gatewayMap map[parentKey]map[
 func buildHTTPVirtualServices(obj config.Config, gateways map[parentKey]map[k8s.SectionName]*parentInfo, domain string) *config.Config {
 	route := obj.Spec.(*k8s.HTTPRouteSpec)
 
-	parentRefs := extractParentReferenceInfo(gateways, route.ParentRefs, route.Hostnames, gvk.HTTPRoute, obj.Namespace)
+	parentRefs := extractParentReferenceInfo(gateways, route.ParentRefs, route.Hostnames, gvk.HTTPRoute, obj.Namespace, false)
 
 	reportError := func(routeErr *ConfigError) {
 		obj.Status.(*kstatus.WrappedStatus).Mutate(func(s config.Status) config.Status {
@@ -398,7 +398,7 @@ func referenceAllowed(p *parentInfo, routeKind config.GroupVersionKind, parentKi
 }
 
 func extractParentReferenceInfo(gateways map[parentKey]map[k8s.SectionName]*parentInfo, routeRefs []k8s.ParentRef,
-	hostnames []k8s.Hostname, kind config.GroupVersionKind, localNamespace string) []routeParentReference {
+	hostnames []k8s.Hostname, kind config.GroupVersionKind, localNamespace string, exclusive bool) []routeParentReference {
 	parentRefs := []routeParentReference{}
 	for _, ref := range routeRefs {
 		ir, err := toInternalParentReference(ref, localNamespace)
@@ -411,6 +411,10 @@ func extractParentReferenceInfo(gateways map[parentKey]map[k8s.SectionName]*pare
 				InternalName:      pr.InternalName,
 				DeniedReason:      referenceAllowed(pr, kind, pk.Kind, hostnames, localNamespace),
 				OriginalReference: ref,
+			}
+			if exclusive && pr.AttachedRoutes > 0 {
+				// TODO: confirm desired behavior according to spec
+				rpi.DeniedReason = fmt.Errorf("cannot attach multiple TCPRoutes to a single port")
 			}
 			if rpi.DeniedReason == nil {
 				// Record that we were able to bind to the parent
@@ -436,7 +440,7 @@ func extractParentReferenceInfo(gateways map[parentKey]map[k8s.SectionName]*pare
 func buildTCPVirtualService(obj config.Config, gateways map[parentKey]map[k8s.SectionName]*parentInfo, domain string) *config.Config {
 	route := obj.Spec.(*k8s.TCPRouteSpec)
 
-	parentRefs := extractParentReferenceInfo(gateways, route.ParentRefs, nil, gvk.TCPRoute, obj.Namespace)
+	parentRefs := extractParentReferenceInfo(gateways, route.ParentRefs, nil, gvk.TCPRoute, obj.Namespace, true)
 
 	reportError := func(routeErr *ConfigError) {
 		obj.Status.(*kstatus.WrappedStatus).Mutate(func(s config.Status) config.Status {
@@ -488,7 +492,7 @@ func buildTCPVirtualService(obj config.Config, gateways map[parentKey]map[k8s.Se
 func buildTLSVirtualService(obj config.Config, gateways map[parentKey]map[k8s.SectionName]*parentInfo, domain string) *config.Config {
 	route := obj.Spec.(*k8s.TLSRouteSpec)
 
-	parentRefs := extractParentReferenceInfo(gateways, route.ParentRefs, nil, gvk.TLSRoute, obj.Namespace)
+	parentRefs := extractParentReferenceInfo(gateways, route.ParentRefs, nil, gvk.TLSRoute, obj.Namespace, false)
 
 	reportError := func(routeErr *ConfigError) {
 		obj.Status.(*kstatus.WrappedStatus).Mutate(func(s config.Status) config.Status {
