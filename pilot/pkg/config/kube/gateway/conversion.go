@@ -1002,6 +1002,9 @@ type parentInfo struct {
 	// ReportAttachedRoutes is a callback that should be triggered once all AttachedRoutes are computed, to
 	// actually store the attached route count in the status
 	ReportAttachedRoutes func()
+
+	// Hack: to allow us to iterate when a listener with a port range is referenced
+	PortRange *k8s.PortRange
 }
 
 // routeParentReference holds information about a route's parent reference
@@ -1072,51 +1075,81 @@ func convertGateways(r *KubernetesResources) ([]config.Config, map[parentKey]map
 		// Extract the addresses. A gateway will bind to a specific Service
 		gatewayServices, skippedAddresses := extractGatewayServices(r, kgw, obj)
 		invalidListeners := []k8s.SectionName{}
-		for i, l := range kgw.Listeners {
-			i := i
+		listenerIndex := 0
+		ref := parentKey{
+			Kind:      gvk.KubernetesGateway,
+			Name:      obj.Name,
+			Namespace: obj.Namespace,
+		}
+		if _, f := gwMap[ref]; !f {
+			gwMap[ref] = map[k8s.SectionName]*parentInfo{}
+		}
+		for _, l := range kgw.Listeners {
 			namespaceLabelReferences.Insert(getNamespaceLabelReferences(l.AllowedRoutes)...)
-			server, ok := buildListener(r, obj, l, i)
-			if !ok {
-				invalidListeners = append(invalidListeners, l.Name)
-				continue
-			}
-			meta := parentMeta(obj, &l.Name)
-			meta[model.InternalGatewayServiceAnnotation] = strings.Join(gatewayServices, ",")
-			// Each listener generates an Istio Gateway with a single Server. This allows binding to a specific listener.
-			gatewayConfig := config.Config{
-				Meta: config.Meta{
-					CreationTimestamp: obj.CreationTimestamp,
-					GroupVersionKind:  gvk.Gateway,
-					Name:              fmt.Sprintf("%s-%s-%s", obj.Name, constants.KubernetesGatewayName, l.Name),
-					Annotations:       meta,
-					Namespace:         obj.Namespace,
-					Domain:            r.Domain,
-				},
-				Spec: &istio.Gateway{
-					Servers: []*istio.Server{server},
-				},
-			}
-			ref := parentKey{
-				Kind:      gvk.KubernetesGateway,
-				Name:      obj.Name,
-				Namespace: obj.Namespace,
-			}
-			if _, f := gwMap[ref]; !f {
-				gwMap[ref] = map[k8s.SectionName]*parentInfo{}
+
+			// TODO: need validation to ensure port and range are mutually exclusive
+			start, end := l.Port, l.Port
+			if l.PortRange != nil {
+				start, end = l.PortRange.Start, l.PortRange.End
+
+				// Hack: insert a fake parentInfo with the port range so that when
+				// we look up the parent from the ref on a route, we can iterate
+				// across the range to allocate a port
+				//
+				// TODO: can we avoid creating all of these (potentiall thousands)
+				// of listeners upfront, but rather create them only for allocated
+				// ports?
+				pri := &parentInfo{
+					InternalName: fmt.Sprintf("%s/%s-%s-%s", obj.Namespace, obj.Name, constants.KubernetesGatewayName, l.Name),
+					PortRange:    l.PortRange,
+				}
+				gwMap[ref][l.Name] = pri
 			}
 
-			pri := &parentInfo{
-				InternalName:     obj.Namespace + "/" + gatewayConfig.Name,
-				AllowedKinds:     generateSupportedKinds(l),
-				Hostnames:        server.Hosts,
-				OriginalHostname: emptyIfNil((*string)(l.Hostname)),
+			for port := start; port <= end; port++ {
+				sectionName := (k8s.SectionName)(fmt.Sprintf("%s-%d", l.Name, port))
+
+				server, err := buildListener(r, obj, l, port)
+				if err != nil {
+					reportListenerCondition(listenerIndex, sectionName, port, l, obj, buildListenerConditions(err))
+					invalidListeners = append(invalidListeners, sectionName)
+					continue
+				}
+
+				meta := parentMeta(obj, &sectionName)
+				meta[model.InternalGatewayServiceAnnotation] = strings.Join(gatewayServices, ",")
+				// Each listener port generates an Istio Gateway with a single Server. This allows binding to a specific listener port.
+				gatewayConfig := config.Config{
+					Meta: config.Meta{
+						CreationTimestamp: obj.CreationTimestamp,
+						GroupVersionKind:  gvk.Gateway,
+						Name:              fmt.Sprintf("%s-%s-%s", obj.Name, constants.KubernetesGatewayName, sectionName),
+						Annotations:       meta,
+						Namespace:         obj.Namespace,
+						Domain:            r.Domain,
+					},
+					Spec: &istio.Gateway{
+						Servers: []*istio.Server{server},
+					},
+				}
+
+				pri := &parentInfo{
+					InternalName:     obj.Namespace + "/" + gatewayConfig.Name,
+					AllowedKinds:     generateSupportedKinds(l),
+					Hostnames:        server.Hosts,
+					OriginalHostname: emptyIfNil((*string)(l.Hostname)),
+				}
+				idx := listenerIndex
+				pri.ReportAttachedRoutes = func() {
+					reportListenerAttachedRoutes(idx, obj, pri.AttachedRoutes)
+				}
+				reportListenerCondition(listenerIndex, sectionName, port, l, obj, buildListenerConditions(nil))
+				listenerIndex++
+
+				gwMap[ref][sectionName] = pri
+				result = append(result, gatewayConfig)
+				servers = append(servers, server)
 			}
-			pri.ReportAttachedRoutes = func() {
-				reportListenerAttachedRoutes(i, obj, pri.AttachedRoutes)
-			}
-			gwMap[ref][l.Name] = pri
-			result = append(result, gatewayConfig)
-			servers = append(servers, server)
 		}
 
 		// If "gateway.istio.io/alias-for" annotation is present, any Route
@@ -1266,7 +1299,7 @@ func getNamespaceLabelReferences(routes *k8s.AllowedRoutes) []string {
 	return res
 }
 
-func buildListener(r *KubernetesResources, obj config.Config, l k8s.Listener, listenerIndex int) (*istio.Server, bool) {
+func buildListenerConditions(err *ConfigError) map[string]*condition {
 	listenerConditions := map[string]*condition{
 		string(k8s.ListenerConditionReady): {
 			reason:  "ListenerReady",
@@ -1287,9 +1320,6 @@ func buildListener(r *KubernetesResources, obj config.Config, l k8s.Listener, li
 			message: "No errors found",
 		},
 	}
-
-	defer reportListenerCondition(listenerIndex, l, obj, listenerConditions)
-	tls, err := buildTLS(l.TLS, obj.Namespace, isAutoPassthrough(obj, l))
 	if err != nil {
 		listenerConditions[string(k8s.ListenerConditionReady)].error = &ConfigError{
 			Reason:  string(k8s.ListenerReasonInvalid),
@@ -1299,21 +1329,28 @@ func buildListener(r *KubernetesResources, obj config.Config, l k8s.Listener, li
 			Reason:  string(k8s.ListenerReasonInvalidCertificateRef),
 			Message: err.Message,
 		}
-		return nil, false
 	}
+	return listenerConditions
+}
+
+func buildListener(r *KubernetesResources, obj config.Config, l k8s.Listener, port k8s.PortNumber) (*istio.Server, *ConfigError) {
+	tls, err := buildTLS(l.TLS, obj.Namespace, isAutoPassthrough(obj, l))
+	if err != nil {
+		return nil, err
+	}
+
 	hostnames := buildHostnameMatch(obj.Namespace, r, l)
-	server := &istio.Server{
+
+	return &istio.Server{
 		Port: &istio.Port{
 			// Name is required. We only have one server per Gateway, so we can just name them all the same
 			Name:     "default",
-			Number:   uint32(l.Port),
+			Number:   uint32(port),
 			Protocol: listenerProtocolToIstio(l.Protocol),
 		},
 		Hosts: hostnames,
 		Tls:   tls,
-	}
-
-	return server, true
+	}, nil
 }
 
 // isAutoPassthrough determines if a listener should use auto passthrough mode. This is used for

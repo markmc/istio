@@ -209,7 +209,7 @@ func reportListenerAttachedRoutes(index int, obj config.Config, i int32) {
 	})
 }
 
-func reportListenerCondition(index int, l k8s.Listener, obj config.Config, conditions map[string]*condition) {
+func reportListenerCondition(index int, name k8s.SectionName, port k8s.PortNumber, l k8s.Listener, obj config.Config, conditions map[string]*condition) {
 	obj.Status.(*kstatus.WrappedStatus).Mutate(func(s config.Status) config.Status {
 		gs := s.(*k8s.GatewayStatus)
 		for index >= len(gs.Listeners) {
@@ -217,7 +217,8 @@ func reportListenerCondition(index int, l k8s.Listener, obj config.Config, condi
 		}
 		cond := gs.Listeners[index].Conditions
 		gs.Listeners[index] = k8s.ListenerStatus{
-			Name:           l.Name,
+			Name:           name,
+			Port:           port,
 			AttachedRoutes: 0, // this will be reported later
 			SupportedKinds: generateSupportedKinds(l),
 			Conditions:     setConditions(obj.Generation, cond, conditions),
