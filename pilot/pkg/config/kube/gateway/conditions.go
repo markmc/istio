@@ -88,8 +88,12 @@ func createRouteStatus(gateways []routeParentReference, obj config.Config, curre
 				Message:            "Route was valid",
 			}
 		}
+		parentRef := gw.OriginalReference
+		if gw.Port != nil {
+			parentRef.Port = gw.Port
+		}
 		gws = append(gws, k8s.RouteParentStatus{
-			ParentRef:      gw.OriginalReference,
+			ParentRef:      parentRef,
 			ControllerName: ControllerName,
 			Conditions:     []metav1.Condition{condition},
 		})

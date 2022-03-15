@@ -406,31 +406,56 @@ func extractParentReferenceInfo(gateways map[parentKey]map[k8s.SectionName]*pare
 			// Cannot handle the reference. Maybe it is for another controller, so we just ignore it
 			continue
 		}
-		appendParent := func(pr *parentInfo, pk parentKey) {
+		appendParent := func(pr *parentInfo, pk parentKey, port *k8s.PortNumber) bool {
 			rpi := routeParentReference{
 				InternalName:      pr.InternalName,
 				DeniedReason:      referenceAllowed(pr, kind, pk.Kind, hostnames, localNamespace),
 				OriginalReference: ref,
+				Port:              port,
+			}
+			if rpi.DeniedReason != nil {
+				return false
 			}
 			if exclusive && pr.AttachedRoutes > 0 {
 				// TODO: confirm desired behavior according to spec
 				rpi.DeniedReason = fmt.Errorf("cannot attach multiple TCPRoutes to a single port")
+				return false
 			}
-			if rpi.DeniedReason == nil {
-				// Record that we were able to bind to the parent
-				pr.AttachedRoutes++
-			}
+			// Record that we were able to bind to the parent
+			pr.AttachedRoutes++
 			parentRefs = append(parentRefs, rpi)
+			return true
 		}
 		if ref.SectionName != nil {
+			tryParent := func(sectionName k8s.SectionName, port *k8s.PortNumber) (*parentInfo, bool) {
+				pr, found := gateways[ir][sectionName]
+				if !found {
+					return nil, false
+				}
+				if pr.PortRange != nil {
+					return pr, false
+				}
+				return pr, appendParent(pr, ir, port)
+			}
+
 			// We are selecting a specific section, so attach just that section
-			if pr, f := gateways[ir][*ref.SectionName]; f {
-				appendParent(pr, ir)
+			if pr, success := tryParent(*ref.SectionName, nil); !success && pr != nil && pr.PortRange != nil {
+				// Alternatively, attach to an available port in the range
+				// TODO: ensure port allocations are stable - e.g. deleting a route should not
+				// cause reallocations
+				for i := pr.PortRange.Start; i <= pr.PortRange.End; i++ {
+					port := i
+					sectionName := (k8s.SectionName)(fmt.Sprintf("%s-%d", *ref.SectionName, port))
+					if _, success = tryParent(sectionName, &port); success {
+						break
+					}
+				}
 			}
 		} else {
 			// no section name set, match all sections
 			for _, pr := range gateways[ir] {
-				appendParent(pr, ir)
+				// TODO: enforce exclusive here too
+				appendParent(pr, ir, nil)
 			}
 		}
 	}
@@ -1015,6 +1040,8 @@ type routeParentReference struct {
 	DeniedReason error
 	// OriginalReference contains the original reference
 	OriginalReference k8s.ParentReference
+	// Port number this route attached to, if selected from a range
+	Port *k8s.PortNumber
 }
 
 // referencesToInternalNames converts valid parent references to names that can be used in VirtualService
