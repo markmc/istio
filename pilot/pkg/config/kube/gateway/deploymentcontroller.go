@@ -294,19 +294,39 @@ func extractServicePorts(gw gateway.Gateway) []corev1.ServicePort {
 	})
 	portNums := map[int32]struct{}{}
 	for i, l := range gw.Spec.Listeners {
-		if _, f := portNums[int32(l.Port)]; f {
-			continue
+		listenerPorts := make([]int32, 0, 1)
+		if l.PortRange != nil && l.PortRange.Start > 0 &&
+			l.PortRange.End > l.PortRange.Start {
+			// TODO: can we avoid configuring individual load-balancer
+			// ports until they are allocated to a route? Does it help
+			// much to do so?
+			for j := l.PortRange.Start; j <= l.PortRange.End; j++ {
+				listenerPorts = append(listenerPorts, int32(j))
+			}
+		} else {
+			// TODO: Port is now optional, so need validation to ensure
+			// that either PortRange or Port are specified
+			listenerPorts = append(listenerPorts, int32(l.Port))
 		}
-		portNums[int32(l.Port)] = struct{}{}
-		name := string(l.Name)
-		if name == "" {
-			// Should not happen since name is required, but in case an invalid resource gets in...
-			name = fmt.Sprintf("%s-%d", strings.ToLower(string(l.Protocol)), i)
+		for j, p := range listenerPorts {
+			if _, f := portNums[p]; f {
+				continue
+			}
+			portNums[p] = struct{}{}
+			name := string(l.Name)
+			if name == "" {
+				// Should not happen since name is required, but in case an invalid resource gets in...
+				name = fmt.Sprintf("%s-%d", strings.ToLower(string(l.Protocol)), i)
+			}
+			if len(listenerPorts) > 1 {
+				// Each port in a range needs its own name
+				name = fmt.Sprintf("%s-%d", name, j)
+			}
+			svcPorts = append(svcPorts, corev1.ServicePort{
+				Name: name,
+				Port: p,
+			})
 		}
-		svcPorts = append(svcPorts, corev1.ServicePort{
-			Name: name,
-			Port: int32(l.Port),
-		})
 	}
 	return svcPorts
 }
